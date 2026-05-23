@@ -1,5 +1,6 @@
 # ATtiny85 DRV8833 Motor Driver
 
+https://youtu.be/sycSdI49hlY?si=9vmVVg6HyiEosMC9 How to set up an Uno as a flashing tool.
 Minimal potentiometer-controlled DC motor firmware for the Digispark (ATtiny85). Turn the knob, motor spins. Click the pot off, power cuts. No app, no cloud, no sleep state to manage.
 
 [![PlatformIO](https://img.shields.io/badge/PlatformIO-arduino-orange.svg)](https://platformio.org/)

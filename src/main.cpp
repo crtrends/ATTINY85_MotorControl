@@ -4,7 +4,10 @@
 //   MCU    : Bare ATtiny85 @ 8 MHz internal oscillator (ISP-flashed, no bootloader)
 //   Driver : DRV8212 breakout, two-input variant (IN1/IN2 → OUT1/OUT2)
 //            DRV8837 clone acceptable for prototyping – identical control interface
-//   Motor  : 3 V, 1 A DC motor with external flyback diode
+//   Motor  : 3 V, 1 A DC motor
+//            Note: DRV8212 contains integrated body diode recirculation paths.
+//            An external Schottky across the motor terminals (not the bridge)
+//            protects VM from back-EMF spikes on disconnect – optional but prudent.
 //   Control: 10 kΩ linear pot with integral SPST power switch
 //            Switch cuts the entire supply – firmware needs no sleep logic.
 //
@@ -28,29 +31,29 @@
 //
 // PWM
 //   Timer0, Fast PWM, OC0A non-inverting, prescaler = 1
-//   f_PWM = 8 MHz / 256 = 31.25 kHz  (above audible range)
-//   Timer0 continues running during idle sleep – PWM output is unaffected.
+//   f_PWM = F_CPU / (1 * 256) = 8 MHz / 256 = 31.25 kHz  (Fast PWM, 8-bit single-slope)
+//   Timer0 runs continuously in IDLE sleep – PWM output is unaffected between bursts.
 //
 // OVERSAMPLING
-//   64 samples summed into uint16_t (max sum = 65472, no overflow).
+//   64 samples using ADC Noise Reduction sleep between conversions.
+//   Sum fits in uint16_t (max = 64 * 1023 = 65472, no overflow).
 //   Right-shifted by 3 → 13-bit effective result (0–8184).
-//   Mapped to OCR0A (0–255).
-//   Hysteresis of ±2 (PWM counts) suppresses residual jitter on OCR0A.
+//   Note: actual ENOB gain depends on sufficient analog dither at the ADC input.
+//   With a filtered pot and stable VCC, gain is primarily noise reduction rather
+//   than true 13-bit accuracy. Still beneficial; comment reflects reality.
+//   Mapped to OCR0A (0–255). Hysteresis of ±2 PWM counts suppresses residual flutter.
 //
 // POWER MANAGEMENT
-//   Sleep mode: SLEEP_MODE_IDLE
-//     - Timer0 keeps running → PWM output holds its last value uninterrupted.
-//     - ADC can run → used to wake via ADC-complete interrupt after each sample.
-//     - CPU halted between ADC conversions → saves ~80% of active current.
-//   WDT wakes the CPU every 250 ms to trigger a fresh oversample burst.
-//   Average current: ~87 µA vs ~3.3 mA always-on (38× battery life improvement).
-//
-// SLEEP STRATEGY DETAIL
-//   During the oversample burst (64 conversions × ~104 µs = ~6.7 ms):
-//     CPU sleeps in IDLE between each conversion, woken by ADC-complete ISR.
-//   Between bursts (remaining ~243 ms of the 250 ms WDT period):
-//     CPU sleeps in POWER-DOWN (deepest sleep, ~1 µA), woken by WDT ISR.
-//   OCR0A holds its last value throughout – motor speed is unaffected by sleep.
+//   Between oversample bursts (~243 ms): SLEEP_MODE_IDLE
+//     CPU halted. Timer0 keeps running → PWM output uninterrupted. ~2 mA.
+//   During oversample burst (~6.7 ms): SLEEP_MODE_ADC (ADC Noise Reduction)
+//     CPU and Timer0 halted between conversions. ADC clock runs. ~0.5 mA.
+//     Timer0 halt causes a ~6.7 ms PWM gap per 250 ms cycle (2.7% of time).
+//     Motor inertia bridges this gap cleanly at normal operating speeds.
+//   WDT fires every 250 ms in interrupt-only mode to pace oversample bursts.
+//   Average current: ~2 mA vs ~3.3 mA always-on. Modest but real saving.
+//   For maximum battery life at the cost of ~6.7 ms PWM gaps every 250 ms,
+//   replace IDLE sleep with POWER_DOWN and disable ADC between bursts.
 //
 // NOTE: No Arduino framework. Uses direct AVR-libc only.
 
@@ -75,7 +78,7 @@
 #define OS_MAX      8184   // 1023 * 64 >> 3  (13-bit full-scale)
 
 // ---------------------------------------------------------------------------
-// Dead zones (scaled from original 10-bit thresholds to 13-bit space)
+// Dead zones (scaled from 10-bit thresholds to 13-bit space)
 //   POT_DEAD_LOW  = round(100  * 8184 / 1023) = 800
 //   POT_DEAD_HIGH = round(1011 * 8184 / 1023) = 8088
 // ---------------------------------------------------------------------------
@@ -90,77 +93,75 @@
 
 // ---------------------------------------------------------------------------
 // WDT period between oversample bursts.
-// WDTO_250MS → ~4 Hz update rate, ~87 µA average current.
-// Increase to WDTO_500MS for longer battery life at the cost of slightly
-// slower pot response (~44 µA average, ~2 Hz).
+// WDTO_250MS → ~4 Hz update rate, ~2 mA average current.
+// WDTO_500MS → ~2 Hz, slightly lower average current, slightly slower response.
 // ---------------------------------------------------------------------------
 #define WDT_PERIOD  WDTO_250MS
 
 // ---------------------------------------------------------------------------
-// Volatile flags set by ISRs, consumed in main loop.
+// Flag set by WDT ISR. Consumed and cleared atomically in main loop.
 // ---------------------------------------------------------------------------
-static volatile uint8_t wdt_fired  = 0;   // set by WDT ISR – time to resample
-static volatile uint8_t adc_done   = 0;   // set by ADC ISR – conversion complete
-static volatile uint16_t adc_result = 0;  // latched ADC value from ISR
+static volatile uint8_t wdt_fired = 0;
 
 // ---------------------------------------------------------------------------
-// WDT ISR – fires every WDT_PERIOD, wakes CPU from power-down sleep.
-// Watchdog is in interrupt-only mode (no reset).
+// WDT ISR – fires every WDT_PERIOD, wakes CPU from IDLE sleep.
 // ---------------------------------------------------------------------------
 ISR(WDT_vect) {
     wdt_fired = 1;
 }
 
 // ---------------------------------------------------------------------------
-// ADC complete ISR – fires after each conversion during oversample burst.
-// Latches result and wakes CPU from idle sleep.
+// ADC complete ISR – wakes CPU from ADC Noise Reduction sleep.
+// Result is read directly from ADC register in mainline after wake;
+// no shared variable needed, eliminating any read-modify race.
 // ---------------------------------------------------------------------------
 ISR(ADC_vect) {
-    adc_result = ADC;
-    adc_done   = 1;
+    // intentionally empty – wake only
 }
 
 // ---------------------------------------------------------------------------
 // Configure WDT for interrupt-only mode (no system reset) at WDT_PERIOD.
-// Must be done with timed write sequence per ATtiny85 datasheet §8.4.
+// Uses timed write sequence per ATtiny85 datasheet §8.4.
 // ---------------------------------------------------------------------------
 static void wdt_init(void) {
     cli();
     wdt_reset();
-    // Enter configuration mode: set WDCE and WDE simultaneously
-    WDTCR = (1 << WDCE) | (1 << WDE);
-    // Set interrupt-only mode + desired period (WDE=0, WDIE=1)
-    WDTCR = (1 << WDIE) | WDT_PERIOD;
+    WDTCR = (1 << WDCE) | (1 << WDE);            // enter configuration mode
+    WDTCR = (1 << WDIE) | (WDT_PERIOD & 0x27);   // interrupt-only + period
     sei();
 }
 
 // ---------------------------------------------------------------------------
-// Perform one 64-sample oversampled ADC read using ADC-complete ISR + idle
-// sleep between conversions. Returns 13-bit result (0–8184).
+// 64-sample oversampled ADC read using ADC Noise Reduction sleep between
+// conversions. Returns 13-bit result (0–8184).
+//
+// ADC Noise Reduction mode halts the CPU and most peripherals (including
+// Timer0) during each conversion, reducing switching noise on the ADC supply.
+// Each conversion takes ~104 µs at 125 kHz ADC clock. Total burst ~6.7 ms.
 // ---------------------------------------------------------------------------
 static uint16_t readADC_oversampled(void) {
     uint16_t sum = 0;
 
-    // Enable ADC-complete interrupt for sleep-between-conversions pattern
-    ADCSRA |= (1 << ADIE);
+    ADCSRA |= (1 << ADIE);    // enable ADC-complete interrupt (required to wake)
 
     for (uint8_t i = 0; i < OS_SAMPLES; i++) {
-        adc_done = 0;
-        ADCSRA |= (1 << ADSC);          // start conversion
+        ADCSRA |= (1 << ADSC);           // start conversion
 
-        // Sleep in IDLE until ADC-complete ISR wakes us.
-        // Timer0 keeps running in IDLE → PWM output unaffected.
-        set_sleep_mode(SLEEP_MODE_IDLE);
+        // Atomically enable sleep and enter ADC Noise Reduction mode.
+        // cli/sei bracketing prevents a race where the ADC-complete ISR
+        // fires between sleep_enable() and sleep_cpu(), which would leave
+        // the CPU sleeping with no pending interrupt to wake it.
+        set_sleep_mode(SLEEP_MODE_ADC);
+        cli();
         sleep_enable();
         sei();
-        sleep_cpu();                     // woken by ADC_vect
+        sleep_cpu();                      // woken by ADC_vect (empty ISR)
         sleep_disable();
 
-        sum += adc_result;
+        sum += ADC;                       // read result directly – no shared state
     }
 
-    // Disable ADC interrupt – not needed outside oversample burst
-    ADCSRA &= ~(1 << ADIE);
+    ADCSRA &= ~(1 << ADIE);   // disable ADC-complete interrupt between bursts
 
     return sum >> OS_SHIFT;
 }
@@ -187,9 +188,9 @@ int main(void) {
     PORTB &= ~(1 << PIN_IN2);
 
     // --- Timer0: Fast PWM, non-inverting on OC0A, prescaler = 1 ----------
-    // WGM01|WGM00 = Fast PWM mode
+    // WGM01|WGM00 = Fast PWM mode (8-bit single-slope)
     // COM0A1      = clear OC0A on compare match, set at BOTTOM (non-inv)
-    // CS00        = clk/1  →  8 MHz / 256 = 31.25 kHz
+    // CS00        = clk/1  →  f_PWM = 8 MHz / 256 = 31.25 kHz
     TCCR0A = (1 << WGM01) | (1 << WGM00) | (1 << COM0A1);
     TCCR0B = (1 << CS00);
     OCR0A  = 0;   // Motor off until pot is read
@@ -205,35 +206,33 @@ int main(void) {
     ADCSRA |= (1 << ADSC);
     while (ADCSRA & (1 << ADSC));
 
-    // Start WDT – fires every WDT_PERIOD to trigger oversample bursts
     wdt_init();
 
     uint8_t last_pwm = 0;
 
     // ---------------------------------------------------------------------------
     // Main loop
-    //   - Sleeps in power-down between WDT wakeups (~243 ms, ~1 µA)
-    //   - On WDT wakeup: runs 64-sample oversample burst (~6.7 ms, ~3.3 mA)
-    //     with CPU idling between each ADC conversion
-    //   - Updates OCR0A only if PWM value changed beyond hysteresis band
+    //   Sleeps in IDLE between WDT wakeups – Timer0 runs, PWM uninterrupted.
+    //   On WDT wakeup: runs 64-sample ADC NR oversample burst (~6.7 ms).
+    //   Updates OCR0A only if PWM value moved outside hysteresis band.
     // ---------------------------------------------------------------------------
     while (1) {
 
-        // Sleep in power-down until WDT fires.
-        // Timer0 is stopped in power-down but OCR0A register retains its value.
-        // The DRV8212 IN1 line will go LOW during power-down (OC0A tristated),
-        // which puts the motor in coast. If holding speed during sleep is needed,
-        // switch to SLEEP_MODE_IDLE here at the cost of higher sleep current.
-        set_sleep_mode(SLEEP_MODE_PWR_DOWN);
+        // Sleep in IDLE until WDT fires. Timer0 keeps running → PWM unaffected.
+        // Atomically arm sleep to prevent race if WDT fires before sleep_cpu().
+        set_sleep_mode(SLEEP_MODE_IDLE);
+        cli();
         sleep_enable();
         sei();
-        sleep_cpu();                     // woken by WDT_vect
+        sleep_cpu();                      // woken by WDT_vect (or any other interrupt)
         sleep_disable();
 
-        if (!wdt_fired) continue;        // spurious wakeup guard
+        // Guard against spurious wakeups (ADC-complete leaking through, etc.)
+        if (!wdt_fired) continue;
+        cli();
         wdt_fired = 0;
+        sei();
 
-        // Oversample burst – CPU idles between ADC conversions
         uint16_t os = readADC_oversampled();
 
         uint8_t pwm;
@@ -245,7 +244,8 @@ int main(void) {
             pwm = (uint8_t) map_val(os, POT_DEAD_LOW, POT_DEAD_HIGH, 1, 254);
         }
 
-        // Update OCR0A only if outside hysteresis band
+        // Update OCR0A only if outside hysteresis band.
+        // Cast to int16_t handles subtraction safely across the 0 boundary.
         if ((int16_t)pwm - (int16_t)last_pwm > HYST_COUNTS ||
             (int16_t)last_pwm - (int16_t)pwm > HYST_COUNTS) {
             OCR0A    = pwm;
