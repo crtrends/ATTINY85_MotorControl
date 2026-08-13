@@ -1,3 +1,71 @@
+// ATtiny85 (bare, no bootloader) – DRV8212 Single-Channel Forward PWM Motor Driver
+//
+// ARDUINO IDE SETUP
+//   Board package : "ATtiny" by David A. Mellis
+//                   Add via File → Preferences → Additional Boards Manager URLs:
+//                   https://raw.githubusercontent.com/damellis/attiny/ide-1.6.x-boards-manager/package_damellis_attiny_index.json
+//   Tools → Board     : ATtiny25/45/85
+//   Tools → Processor : ATtiny85
+//   Tools → Clock     : 8 MHz (internal)
+//   Tools → Programmer: Arduino as ISP
+//   First flash only  : Tools → Burn Bootloader
+//                       (sets fuses, writes no bootloader)
+//   Every flash after : Sketch → Upload Using Programmer
+//
+// HARDWARE
+//   MCU    : Bare ATtiny85 @ 8 MHz internal oscillator
+//   Driver : DRV8212 breakout, two-input variant (IN1/IN2 → OUT1/OUT2)
+//            DRV8837 clone acceptable for prototyping
+//   Motor  : 3 V DC motor
+//   Control: 10 kΩ linear pot with integral SPST power switch
+//
+// PINOUT (ATtiny85 physical DIP-8 pin → port bit)
+//   Pin 5  PB0 / OC0A  → DRV8212 IN1   (PWM output)
+//   Pin 6  PB1         → DRV8212 IN2   (held LOW = forward / coast)
+//   Pin 7  PB2 / ADC1  → Pot wiper     (100 nF wiper-to-GND recommended)
+//
+// DRV8212 TRUTH TABLE (two-input variant)
+//   IN1   IN2   →  Output
+//   PWM   LOW   →  Forward PWM   (fast decay)
+//   LOW   LOW   →  Coast
+//   HIGH  HIGH  →  Brake         (unused)
+//
+// POWER
+//   Li-ion (+) → ATtiny85 VCC (pin 8)
+//   Li-ion (–) → ATtiny85 GND (pin 4)
+//   DRV8212 VM → same Li-ion (+) rail
+//   All grounds common.
+//   DRV8212 nSLEEP tied directly to VCC.
+//
+// PWM
+//   Timer0 Fast PWM, OC0A non-inverting, prescaler = 1
+//   f_PWM = F_CPU / (1 × 256)
+//         = 8 MHz / 256
+//         = 31.25 kHz
+//
+//   Timer0 runs continuously.
+//   PWM output is never interrupted by sleep.
+//
+// CONTROL LOOP
+//   Timer1 generates a periodic interrupt at ~62.5 Hz.
+//   Main loop sleeps in IDLE mode between updates.
+//   Timer0 continues running during IDLE sleep.
+//
+// ADC OVERSAMPLING
+//   16 samples averaged per update.
+//   Oversampling improves noise reduction and may improve effective
+//   resolution if sufficient analog noise/dither exists.
+//
+// POWER
+//   CPU sleeps in IDLE between update intervals.
+//   Timer0 PWM remains active continuously.
+//   ADC disabled outside conversion burst to reduce current.
+//
+// NOTE
+//   Timer0 is reconfigured from Arduino-core defaults.
+//   millis(), delay(), tone(), and analogWrite() timing assumptions
+//   are therefore invalid and intentionally unused.
+
 #include <Arduino.h>
 #include <avr/io.h>
 #include <avr/interrupt.h>
@@ -6,91 +74,84 @@
 // ---------------------------------------------------------------------------
 // Pin assignments
 // ---------------------------------------------------------------------------
-#define PIN_IN1    PB0
-#define PIN_IN2    PB1
-#define ADC_CH     1
+#define PIN_IN1 PB0
+#define PIN_IN2 PB1
+#define ADC_CH 1
 
 // ---------------------------------------------------------------------------
 // Oversampling
 // ---------------------------------------------------------------------------
-#define OS_SAMPLES     16
-#define OS_SHIFT       2
+#define OS_SAMPLES 16
+#define OS_SHIFT 2
+
+// 16 × 1023 >> 2 = 4092
+#define OS_MAX 4092
 
 // ---------------------------------------------------------------------------
-// Pot dead zones (12-bit oversampled space)
+// Pot dead zones (12-bit oversampled space, 0–4092)
+//
+// POT_DEAD_LOW  : OS counts below which output is zero.
+//                 Set near true pot minimum to catch noise floor only.
+//                 Typical wiper noise floor is ~5–20 OS counts.
+//
+// POT_DEAD_HIGH : OS counts above which output is full on.
+//                 Set near true pot maximum.
+//
+// POT_MOTOR_MIN : PWM floor below which this motor won't spin.
+//                 Tune this value per motor — start at 60, raise if stalling.
 // ---------------------------------------------------------------------------
-#define POT_DEAD_LOW   400
-#define POT_DEAD_HIGH  4047
-
+#define POT_DEAD_LOW    40
+#define POT_DEAD_HIGH   4060
+#define POT_MOTOR_MIN   100
+// ---------------------------------------------------------------------------
+// Direction
+// 0 = CW = faster, 1 = CW = slower
+// ---------------------------------------------------------------------------
+#define POT_INVERT  1
 // ---------------------------------------------------------------------------
 // PWM hysteresis
 // ---------------------------------------------------------------------------
-#define PWM_HYST       2
+#define HYST_COUNTS 1
 
 // ---------------------------------------------------------------------------
-// Timer1 update rate
+// Update rate
 //
-// ATtiny85 Timer1 is 8-bit.
+// Timer1:
+//   8 MHz / 64 prescaler = 125 kHz
+//   OCR1C = 1999
 //
-// Timer1 clock:
-//   8 MHz / 256 prescaler = 31.25 kHz
-//
-// OCR1C = 255:
-//
-//   31250 / 256 = 122.07 Hz interrupt rate
-//
-// Software divides by 2:
-//   ~61 Hz control loop update rate
+//   125000 / (1999 + 1) = 62.5 Hz
 // ---------------------------------------------------------------------------
 static volatile uint8_t update_flag = 0;
 
 // ---------------------------------------------------------------------------
-// Timer1 Compare A ISR
+// Timer1 compare ISR
 // ---------------------------------------------------------------------------
-ISR(TIMER1_COMPA_vect)
-{
-    static uint8_t divider = 0;
-
-    divider ^= 1;
-
-    if (divider)
-    {
-        update_flag = 1;
-    }
+ISR(TIMER1_COMPA_vect) {
+  update_flag = 1;
 }
 
 // ---------------------------------------------------------------------------
-// Empty ADC ISR
+// Minimal integer map()
+// ---------------------------------------------------------------------------
+static inline uint8_t map_u16_to_u8(
+  uint16_t x,
+  uint16_t in_min,
+  uint16_t in_max,
+  uint16_t out_min,  // <-- was uint8_t, caused subtle promotion issues
+  uint16_t out_max) {
+  return (uint32_t)(x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
+}
+
+// ---------------------------------------------------------------------------
+// Single ADC conversion
 //
-// Used only to wake CPU from sleep during ADC conversion.
+// Uses IDLE sleep so Timer0 PWM continues uninterrupted.
 // ---------------------------------------------------------------------------
-ISR(ADC_vect)
-{
-}
+static uint16_t adc_read_sleep(void) {
+  ADCSRA |= (1 << ADSC);
 
-// ---------------------------------------------------------------------------
-// Integer mapping helper
-// ---------------------------------------------------------------------------
-static inline uint8_t map_u16_to_u8(uint16_t x,
-                                    uint16_t in_min,
-                                    uint16_t in_max,
-                                    uint8_t out_min,
-                                    uint8_t out_max)
-{
-    return (uint32_t)(x - in_min) *
-           (out_max - out_min) /
-           (in_max - in_min) +
-           out_min;
-}
-
-// ---------------------------------------------------------------------------
-// Sleep once in IDLE mode
-//
-// Timer0 PWM continues running during IDLE sleep.
-// cli/sei ordering prevents AVR sleep race condition.
-// ---------------------------------------------------------------------------
-static inline void sleep_idle_once(void)
-{
+  while (ADCSRA & (1 << ADSC)) {
     set_sleep_mode(SLEEP_MODE_IDLE);
 
     cli();
@@ -100,188 +161,141 @@ static inline void sleep_idle_once(void)
     sleep_cpu();
 
     sleep_disable();
-}
+  }
 
-// ---------------------------------------------------------------------------
-// Perform one ADC conversion while sleeping in IDLE mode
-//
-// IDLE sleep keeps Timer0 PWM running continuously.
-// ADC interrupt wakes CPU on conversion completion.
-// ---------------------------------------------------------------------------
-static uint16_t adc_read_once_sleep(void)
-{
-    ADCSRA |= (1 << ADSC);
-
-    while (ADCSRA & (1 << ADSC))
-    {
-        sleep_idle_once();
-    }
-
-    return ADC;
+  return ADC;
 }
 
 // ---------------------------------------------------------------------------
 // Oversampled ADC read
 // ---------------------------------------------------------------------------
-static uint16_t readADC_oversampled(void)
-{
-    uint16_t sum = 0;
+static uint16_t readADC_oversampled(void) {
+  uint16_t sum = 0;
 
-    // Enable ADC
-    ADCSRA |= (1 << ADEN);
+  // Enable ADC
+  ADCSRA |= (1 << ADEN);
 
-    // Enable ADC-complete interrupt
-    ADCSRA |= (1 << ADIE);
+  // Throwaway conversion after enabling ADC
+  adc_read_sleep();
 
-    // Throwaway conversion after ADC enable
-    adc_read_once_sleep();
+  for (uint8_t i = 0; i < OS_SAMPLES; i++) {
+    sum += adc_read_sleep();
+  }
 
-    // Oversample burst
-    for (uint8_t i = 0; i < OS_SAMPLES; i++)
-    {
-        sum += adc_read_once_sleep();
-    }
+  // Disable ADC outside burst to save current
+  ADCSRA &= ~(1 << ADEN);
 
-    // Disable ADC interrupt
-    ADCSRA &= ~(1 << ADIE);
-
-    // Disable ADC outside conversion burst
-    ADCSRA &= ~(1 << ADEN);
-
-    return (sum >> OS_SHIFT);
+  return (sum >> OS_SHIFT);
 }
 
 // ---------------------------------------------------------------------------
 // Setup
 // ---------------------------------------------------------------------------
-void setup(void)
-{
-    cli();
+void setup(void) {
+  // Disable digital input buffer on ADC pin
+  DIDR0 |= (1 << ADC1D);
 
-    // Disable digital input buffer on ADC pin
-    DIDR0 |= (1 << ADC1D);
+  // -----------------------------------------------------------------------
+  // GPIO
+  // -----------------------------------------------------------------------
+  DDRB |= (1 << PIN_IN1) | (1 << PIN_IN2);
 
-    // -----------------------------------------------------------------------
-    // GPIO
-    // -----------------------------------------------------------------------
-    DDRB |= (1 << PIN_IN1) | (1 << PIN_IN2);
+  // IN2 LOW = forward direction
+  PORTB &= ~(1 << PIN_IN2);
 
-    // IN1 low initially
-    PORTB &= ~(1 << PIN_IN1);
+  // -----------------------------------------------------------------------
+  // Timer0 PWM
+  // -----------------------------------------------------------------------
+  TCCR0A =
+    (1 << WGM01) | (1 << WGM00) | (1 << COM0A1);
 
-    // IN2 low permanently (forward/coast mode)
-    PORTB &= ~(1 << PIN_IN2);
+  TCCR0B =
+    (1 << CS00);
 
-    // -----------------------------------------------------------------------
-    // Timer0 Fast PWM
-    //
-    // Fast PWM, non-inverting, clk/1
-    //
-    // f_PWM = 8 MHz / 256 = 31.25 kHz
-    // -----------------------------------------------------------------------
-    TCCR0A =
-        (1 << WGM01) |
-        (1 << WGM00) |
-        (1 << COM0A1);
+  OCR0A = 0;
 
-    TCCR0B =
-        (1 << CS00);
+  // -----------------------------------------------------------------------
+  // ADC
+  //
+  // VCC reference
+  // ADC1 input
+  // ADC clock = 8 MHz / 64 = 125 kHz
+  // -----------------------------------------------------------------------
+  ADMUX =
+    (ADC_CH & 0x07);
 
-    OCR0A = 0;
+  ADCSRA =
+    (1 << ADPS2) | (1 << ADPS1);
 
-    // -----------------------------------------------------------------------
-    // ADC
-    //
-    // VCC reference
-    // ADC1 input
-    // ADC clock = 8 MHz / 64 = 125 kHz
-    // -----------------------------------------------------------------------
-    ADMUX =
-        (ADC_CH & 0x07);
+  // -----------------------------------------------------------------------
+  // Timer1 periodic interrupt (~62.5 Hz)
+  //
+  // ATtiny85 Timer1 is high-speed and slightly unusual.
+  // CTC mode with OCR1C as TOP.
+  // -----------------------------------------------------------------------
+  TCCR1 =
+    (1 << CTC1) | (1 << CS12) | (1 << CS11);
 
-    ADCSRA =
-        (1 << ADPS2) |
-        (1 << ADPS1);
+  GTCCR = 0;
 
-    // -----------------------------------------------------------------------
-    // Timer1 periodic interrupt
-    //
-    // Timer1:
-    //   clock = 8 MHz / 256 = 31.25 kHz
-    //   TOP   = 255
-    //
-    // Interrupt frequency:
-    //   31250 / 256 = 122 Hz
-    //
-    // ISR divides by 2:
-    //   ~61 Hz control updates
-    // -----------------------------------------------------------------------
-    TCCR1 =
-        (1 << CTC1) |
-        (1 << CS13);
+  OCR1C = 1999;
+  OCR1A = 1999;
 
-    OCR1C = 255;
-    OCR1A = 255;
+  TIMSK |= (1 << OCIE1A);
 
-    TIMSK |= (1 << OCIE1A);
-
-    sei();
+  sei();
 }
 
 // ---------------------------------------------------------------------------
 // Main loop
 // ---------------------------------------------------------------------------
-void loop(void)
-{
-    static uint8_t last_pwm = 0;
+void loop(void) {
+  static uint8_t last_pwm = 0;
 
-    // -----------------------------------------------------------------------
-    // Sleep until next control-loop update
-    // -----------------------------------------------------------------------
-    while (!update_flag)
-    {
-        sleep_idle_once();
-    }
-
+  while (!update_flag) {
+    set_sleep_mode(SLEEP_MODE_IDLE);
     cli();
-    update_flag = 0;
+    sleep_enable();
     sei();
+    sleep_cpu();
+    sleep_disable();
+  }
 
-    // -----------------------------------------------------------------------
-    // Read potentiometer
-    // -----------------------------------------------------------------------
-    uint16_t os = readADC_oversampled();
+  cli();
+  update_flag = 0;
+  sei();
 
-    // -----------------------------------------------------------------------
-    // Map ADC value to PWM
-    // -----------------------------------------------------------------------
-    uint8_t pwm;
+  // -----------------------------------------------------------------------
+  // Read potentiometer + optional invert
+  // -----------------------------------------------------------------------
+  uint16_t os = readADC_oversampled();
+#if POT_INVERT
+  os = OS_MAX - os;
+#endif
 
-    if (os <= POT_DEAD_LOW)
-    {
-        pwm = 0;
-    }
-    else if (os >= POT_DEAD_HIGH)
-    {
-        pwm = 255;
-    }
-    else
-    {
-        pwm = map_u16_to_u8(
-            os,
-            POT_DEAD_LOW,
-            POT_DEAD_HIGH,
-            1,
-            254);
-    }
+  // -----------------------------------------------------------------------
+  // Map to PWM
+  // -----------------------------------------------------------------------
+  uint8_t pwm;
 
-    // -----------------------------------------------------------------------
-    // Hysteresis suppresses last-bit flutter
-    // -----------------------------------------------------------------------
-    if ((int16_t)pwm - (int16_t)last_pwm > PWM_HYST ||
-        (int16_t)last_pwm - (int16_t)pwm > PWM_HYST)
-    {
-        OCR0A = pwm;
-        last_pwm = pwm;
-    }
+  if (os <= POT_DEAD_LOW) {
+    pwm = 0;
+  } else if (os >= POT_DEAD_HIGH) {
+    pwm = 255;
+  } else {
+    pwm = map_u16_to_u8(
+      os,
+      POT_DEAD_LOW,
+      POT_DEAD_HIGH,
+      POT_MOTOR_MIN,
+      255);
+  }
+
+  // -----------------------------------------------------------------------
+  // Hysteresis
+  // -----------------------------------------------------------------------
+  if ((int16_t)pwm - (int16_t)last_pwm > HYST_COUNTS || (int16_t)last_pwm - (int16_t)pwm > HYST_COUNTS) {
+    OCR0A = pwm;
+    last_pwm = pwm;
+  }
 }
